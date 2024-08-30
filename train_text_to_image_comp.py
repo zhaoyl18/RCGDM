@@ -173,8 +173,13 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
     indices = torch.randint(0, len(args.validation_prompts), (96,), generator=generator)  # Uniformly sample N indices
     val_prompts = [args.validation_prompts[i] for i in indices.tolist()]
     
+    transform = transforms.Compose([
+            transforms.Resize((512, 512)),  # Resize to 512x512
+            transforms.ToTensor(),  # Convert to tensor and normalize to [0, 1]
+        ])
+            
     for i in range(len(val_prompts)):
-        class_labels = torch.tensor(i % 3).to(accelerator.device, dtype=torch.long)
+        class_labels = torch.tensor(i % 4).to(accelerator.device, dtype=torch.long)
         if torch.backends.mps.is_available():
             autocast_ctx = nullcontext()
         else:
@@ -185,42 +190,21 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
                              num_inference_steps=50, 
                              generator=generator,
                              class_labels=class_labels).images[0]
+        # Convert PIL image to Tensor and normalize it to [0, 1]
+        img_tensor = transform(image)
+        images.append(img_tensor)
 
-        images.append(image)
+    # Convert the list of images to a batch tensor
+    images_tensor = torch.stack(images)  # Shape: (B, C, H, W)
 
-    from transformers import CLIPModel, CLIPProcessor
-    from aesthetic_scorer import MLPDiff
-
-    ASSETS_PATH = "./assets"
-
-    clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-
-    clip.to(accelerator.device)
-    clip.requires_grad_(False)
-    clip.eval()
-
-    eval_model = MLPDiff().to(accelerator.device)
-    eval_model.requires_grad_(False)
-    eval_model.eval()
-    s = torch.load(os.path.join(ASSETS_PATH, "sac+logos+ava1-l14-linearMSE.pth"), map_location=accelerator.device)
-    eval_model.load_state_dict(s)
-    
-    inputs = processor(images=images, return_tensors="pt")
-    with torch.no_grad():
-
-        # Get CLIP embeddings
-        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
-        embeddings = clip.get_image_features(**inputs)
-        embeddings = embeddings / torch.linalg.vector_norm(embeddings, dim=-1, keepdim=True)
-        
-        # Get the predicted score
-        scores = eval_model(embeddings).to(accelerator.device)
+    from compressibility_scorer import jpeg_compressibility
+    compressibility_scores = jpeg_compressibility(images_tensor)
+    scores = torch.tensor(compressibility_scores, dtype=torch.float32).view(-1, 1)
 
     # Calculate reward means
     reward_means = []
-    for i in range(3):  # There are 3 patterns (0,3,6,...; 1,4,7,...; 2,5,8,...)
-        indices = list(range(i, scores.size(0), 3))
+    for i in range(4):  # There are 4 patterns (0,4,8,...; 1,5,9,...;...)
+        indices = list(range(i, scores.size(0), 4))
         group_mean = scores[indices].mean().item()
         reward_means.append(group_mean)
     
@@ -232,12 +216,13 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
             tracker.log(
                 {
                     "validation": [
-                        wandb.Image(image, caption=f"{val_prompts[i]} | cond={i % 3} | {scores[i][0].item():.2f}")
+                        wandb.Image(image, caption=f"{val_prompts[i]} | cond={i % 4} | {scores[i][0].item():.2f}")
                         for i, image in enumerate(images)
                     ],
                     "class_0_reward_mean": reward_means[0],
                     "class_1_reward_mean": reward_means[1],
                     "class_2_reward_mean": reward_means[2],
+                    "class_3_reward_mean": reward_means[3],
                 }
             )
         else:
@@ -536,7 +521,7 @@ def parse_args():
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="text2image-fine-tune",
+        default="text2image-finetune_compressibility",
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -661,7 +646,7 @@ def main():
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
     
-    num_classes = 3
+    num_classes = 4
     unet.class_embedding = torch.nn.Embedding(num_classes, embedding_dim=1280) # Set up the class embedding layer
     torch.nn.init.zeros_(unet.class_embedding.weight) # Initialized to zero for keeping KL divergence low at the beginning
     assert unet.class_embedding.weight.requires_grad, "Class embeddings not added correctly"
@@ -819,8 +804,8 @@ def main():
                 f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
             )
             
-    ## add another conditioning on the scores
-    score_column = column_names[2]
+    ## add another conditioning on the compressibility scores
+    score_column = column_names[3]
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
@@ -858,9 +843,11 @@ def main():
         scores = examples[score_column]
         for score in scores:
             score = float(score)
-            if score >= 6.0:
+            if score >= -60.0:
+                class_labels.append(3)
+            elif -85.0 <= score < -60.0:
                 class_labels.append(2)
-            elif 5.5 <= score < 6.0:
+            elif -110.0 <= score < -85.0:
                 class_labels.append(1)
             else:
                 class_labels.append(0)
