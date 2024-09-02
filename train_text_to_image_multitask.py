@@ -171,6 +171,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
     images = []
+    images_pil = []
     
     indices = torch.randint(0, len(args.validation_prompts), (96,), generator=generator)  # Uniformly sample N indices
     val_prompts = [args.validation_prompts[i] for i in indices.tolist()]
@@ -193,6 +194,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
                              generator=generator,
                              class_labels=class_label).images[0]
         # Convert PIL image to Tensor and normalize it to [0, 1]
+        images_pil.append(image)
         img_tensor = transform(image)
         images.append(img_tensor)
 
@@ -201,51 +203,108 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
 
     from compressibility_scorer import jpeg_compressibility
     compressibility_scores = jpeg_compressibility(images_tensor)
-    eval_rewards = torch.tensor(compressibility_scores, dtype=torch.float32).view(-1).to(accelerator.device)
+    eval_comp_rewards = torch.tensor(compressibility_scores, dtype=torch.float32).view(-1).to(accelerator.device)
+    
+    from transformers import CLIPModel, CLIPProcessor
+    from aesthetic_scorer import MLPDiff
+
+    ASSETS_PATH = "./assets"
+
+    clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+
+    clip.to(accelerator.device)
+    clip.requires_grad_(False)
+    clip.eval()
+
+    eval_model = MLPDiff().to(accelerator.device)
+    eval_model.requires_grad_(False)
+    eval_model.eval()
+    s = torch.load(os.path.join(ASSETS_PATH, "sac+logos+ava1-l14-linearMSE.pth"), map_location=accelerator.device)
+    eval_model.load_state_dict(s)
+    
+    inputs = processor(images=images_pil, return_tensors="pt")
+    with torch.no_grad():
+
+        # Get CLIP embeddings
+        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+        embeddings = clip.get_image_features(**inputs)
+        embeddings = embeddings / torch.linalg.vector_norm(embeddings, dim=-1, keepdim=True)
+        
+        # Get the predicted score
+        eval_aes_rewards = eval_model(embeddings).view(-1).to(accelerator.device)
+
+    
     
     # Calculate classification metrics
-    eval_labels = torch.tensor([i % 4 for i in range(eval_rewards.size(0))], dtype=torch.long).to(accelerator.device)
+    eval_labels = torch.tensor([i % 4 for i in range(eval_aes_rewards.size(0))], dtype=torch.long).to(accelerator.device)
+    aesthetic_class_labels = eval_labels // 2
+    compressibility_class_labels = eval_labels % 2
     
-    # Calculate class-wise mean and std
-    class_0_rewards = eval_rewards[eval_labels == 0]
-    class_1_rewards = eval_rewards[eval_labels == 1]
-    class_2_rewards = eval_rewards[eval_labels == 2]
-    class_3_rewards = eval_rewards[eval_labels == 3]
+    task_metrics = {}
+    aesthetic_predictions = []
+    comp_predictions = []
     
-    class_0_mean = class_0_rewards.mean() if len(class_0_rewards) > 0 else 0
-    class_0_std = class_0_rewards.std() if len(class_0_rewards) > 0 else 0
-    class_1_mean = class_1_rewards.mean() if len(class_1_rewards) > 0 else 0
-    class_1_std = class_1_rewards.std() if len(class_1_rewards) > 0 else 0
-    
-    class_2_mean = class_2_rewards.mean() if len(class_2_rewards) > 0 else 0
-    class_2_std = class_2_rewards.std() if len(class_2_rewards) > 0 else 0
-    class_3_mean = class_3_rewards.mean() if len(class_3_rewards) > 0 else 0
-    class_3_std = class_3_rewards.std() if len(class_3_rewards) > 0 else 0
-    
-    predicted_classes = classify_compressibility_scores_4class(eval_rewards)
-    metrics = compute_classification_metrics(predicted_classes, eval_labels)
-
+    for task in ['aesthetic', 'compressibility']:
+        if task == 'aesthetic':
+            eval_rewards = eval_aes_rewards
+            eval_class_labels = aesthetic_class_labels
+        elif task == 'compressibility':
+            eval_rewards = eval_comp_rewards
+            eval_class_labels = compressibility_class_labels
+        else:
+            raise NotImplementedError
+        
+        
+        # Calculate class-wise mean and std
+        class_0_rewards = eval_rewards[eval_class_labels == 0]
+        class_1_rewards = eval_rewards[eval_class_labels == 1]
+        class_0_mean = class_0_rewards.mean() if len(class_0_rewards) > 0 else 0
+        class_0_std = class_0_rewards.std() if len(class_0_rewards) > 0 else 0
+        class_1_mean = class_1_rewards.mean() if len(class_1_rewards) > 0 else 0
+        class_1_std = class_1_rewards.std() if len(class_1_rewards) > 0 else 0
+        
+        # Calculate classification metrics
+        if task == 'compressibility':
+            from compressibility_scorer import classify_compressibility_scores
+            predicted_classes = classify_compressibility_scores(eval_rewards)
+            comp_predictions.extend(predicted_classes.tolist())
+        elif task == 'aesthetic':
+            from aesthetic_scorer import classify_aesthetic_scores_easy
+            predicted_classes = classify_aesthetic_scores_easy(eval_rewards)
+            aesthetic_predictions.extend(predicted_classes.tolist())
+            
+        cls_metrics = compute_classification_metrics(predicted_classes, eval_class_labels)
+        
+        task_metrics[f'eval/{task}/class_0_rewards_mean'] = class_0_mean
+        task_metrics[f'eval/{task}/class_0_rewards_std'] = class_0_std
+        task_metrics[f'eval/{task}/class_1_rewards_mean'] = class_1_mean
+        task_metrics[f'eval/{task}/class_1_rewards_std'] = class_1_std
+        task_metrics[f'eval_{task}_accuracy'] = cls_metrics['accuracy']
+        task_metrics[f'eval_{task}_macro_F1'] = cls_metrics['macro_F1']
+        task_metrics[f'eval/{task}/macro_precision'] = cls_metrics['macro_precision']
+        task_metrics[f'eval/{task}/macro_recall'] = cls_metrics['macro_recall']
+                                      
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
         elif tracker.name == "wandb":
+            aesthetic_label = aesthetic_class_labels[i]
+            compressibility_label = compressibility_class_labels[i]
+            
+            aesthetic_reward = eval_aes_rewards[i]
+            compressibility_reward = eval_comp_rewards[i]
+            
             tracker.log(
                 {
                     "validation": [
-                        wandb.Image(image, caption=f"{val_prompts[i]} | cond={eval_labels[i]} | (result={predicted_classes[i]})")
+                        wandb.Image(image, caption=f"{val_prompts[i]} | cond=({aesthetic_label},{compressibility_label}) | result=({aesthetic_reward:.1f},{compressibility_reward:.1f})")
                         for i, image in enumerate(images)
-                    ],
-                    "class_0_reward_mean": class_0_mean,
-                    "class_1_reward_mean": class_1_mean,
-                    "class_2_reward_mean": class_2_mean,
-                    "class_3_reward_mean": class_3_mean,
-                    "eval_accuracy": metrics['accuracy'],
-                    "eval_macro_F1": metrics['macro_F1'],
-                    "eval_macro_precision": metrics['macro_precision'],
-                    "eval_macro_recall": metrics['macro_recall'],
-                }
+                    ]
+                }, step=epoch
             )
+            tracker.log(task_metrics, step=epoch)
         else:
             logger.warning(f"validation logging not implemented for {tracker.name}")
 
@@ -542,7 +601,7 @@ def parse_args():
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="text2image-finetune_compressibility",
+        default="text2image-finetune_multitask",
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -826,7 +885,8 @@ def main():
             )
             
     ## add another conditioning on the compressibility scores
-    score_column = column_names[3]
+    aes_score_column = column_names[2]
+    comp_score_column = column_names[3]
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
@@ -861,17 +921,22 @@ def main():
     # Preprocessing the datasets.
     def create_labels(examples):
         class_labels = []
-        scores = examples[score_column]
-        for score in scores:
-            score = float(score)
-            if score >= -60.0:
+        aes_scores = examples[aes_score_column]
+        comp_scores = examples[comp_score_column]
+        for idx in range(len(aes_scores)):
+            aes_score = float(aes_scores[idx])
+            comp_score = float(comp_scores[idx])
+            if aes_score >= 5.70 and comp_score >= -70.0:
                 class_labels.append(3)
-            elif -85.0 <= score < -60.0:
+            elif aes_score >= 5.70 and comp_score < -70.0:
                 class_labels.append(2)
-            elif -110.0 <= score < -85.0:
+            elif aes_score < 5.70 and comp_score >= -70.0:
                 class_labels.append(1)
-            else:
+            elif aes_score < 5.70 and comp_score < -70.0:
                 class_labels.append(0)
+            else:
+                raise ValueError(f"Invalid class label for aes_score={aes_score} and comp_score={comp_score}")
+        
         return class_labels
 
     def preprocess_train(examples):
