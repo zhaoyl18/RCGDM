@@ -8,6 +8,8 @@ from tqdm import tqdm
 import torch.nn as nn
 from transformers import CLIPModel, CLIPProcessor
 from aesthetic_scorer import SinusoidalTimeMLP
+
+from accelerate import Accelerator
 from accelerate.logging import get_logger 
 
 from vae import sd_model
@@ -17,7 +19,7 @@ logger = get_logger(__name__)
 ### Configs #### 
 
 lr = 0.001
-num_data = 50000
+num_data = 100000
 num_epochs = 10
 batch_size = 16 # Batch size for training
 # stable diffusion hyperparameters.
@@ -32,7 +34,7 @@ config={
     'latent_dim':latent_dim,
 }
 
-wandb.init(project="RCGDM", config=config)
+wandb.init(project="SVDD-ValueFunction-aesthetic", config=config)
 logger.info(f"\n{config}")
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -48,7 +50,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 targets = torch.tensor(np.load('new_data/all_y_noisy.npy'), dtype=torch.float32)
 encoded_imgs = torch.tensor(np.load('new_data/all_vae_latents.npy'), dtype=torch.float32)
 
-train_dataset = torch.utils.data.TensorDataset(encoded_imgs, targets)
+train_dataset = torch.utils.data.TensorDataset(encoded_imgs[:num_data], targets[:num_data])
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
 
 
@@ -98,10 +100,10 @@ for epoch in tqdm(range(num_epochs), desc="Epoch"):
         epoch_loss += loss.item()
         
         if i % 2000 == 0 and i != 0:
-            torch.save(model, f'model/reward_predictor_epoch_{epoch}_iter_{i}.pth')
+            torch.save(model, f'aes_model/reward_predictor_epoch_{epoch}_iter_{i}.pth')
 
     wandb.log({"epoch_loss": epoch_loss/(i+1)})
     logger.info(f"epoch_loss: {epoch_loss/(i+1):.4f}")
     
-    torch.save(model, f'model/reward_predictor_epoch_{epoch}.pth')
+    torch.save(model, f'aes_model/reward_predictor_epoch_{epoch}.pth')
 

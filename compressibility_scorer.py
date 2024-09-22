@@ -3,6 +3,7 @@
 import os,sys
 cwd = os.getcwd()
 sys.path.append(cwd)
+import math
 
 from importlib import resources
 import torch
@@ -98,6 +99,57 @@ class ThreeLayerConvNet(nn.Module):
         out = out.view(out.size(0), -1)
         out = self.fc(out)
         return out
+    
+class SinusoidalTimeConvNet(nn.Module):
+    def __init__(self, num_channels=3, num_classes=1, time_encoding_dim=64, dtype=torch.float32):
+        super(SinusoidalTimeConvNet, self).__init__()
+        
+        self.dtype = dtype
+        self.time_encoding_dim = time_encoding_dim
+
+        # Standard convolutional layers
+        self.layer1 = ResidualBlock(num_channels, 64, stride=1)
+        self.layer2 = ResidualBlock(64 + time_encoding_dim, 128, stride=2)  # Concatenating time embedding here
+        self.layer3 = ResidualBlock(128, 256, stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(256, num_classes)
+
+    def sinusoidal_encoding(self, timesteps, height, width):
+        # Normalize timesteps to be in the range [0, 1]
+        timesteps = timesteps.float() / 1000.0  # Assuming timesteps are provided as integers
+
+        # Generate a series of frequencies for the sinusoidal embeddings
+        frequencies = torch.exp(torch.arange(0, self.time_encoding_dim, 2, dtype=torch.float32) * -(math.log(10000.0) / self.time_encoding_dim))
+        frequencies = frequencies.to(timesteps.device)
+
+        # Apply the frequencies to the timesteps
+        arguments = timesteps[:, None] * frequencies[None, :]
+        encoding = torch.cat([torch.sin(arguments), torch.cos(arguments)], dim=1)
+
+        # Reshape the time embedding to match the spatial dimensions (height, width)
+        encoding = encoding[:, :, None, None].repeat(1, 1, height, width)  # Repeat for spatial dimensions
+        return encoding
+
+    def forward(self, x, timesteps):
+        batch_size, channels, height, width = x.size()
+
+        # Pass through the first convolutional layer
+        out = self.layer1(x.to(self.dtype))
+
+        # Generate sinusoidal embeddings for the timesteps and expand to match the feature map dimensions
+        timestep_embed = self.sinusoidal_encoding(timesteps, out.size(2), out.size(3))
+
+        # Concatenate the time embedding with the output of the first layer
+        combined_input = torch.cat([out, timestep_embed], dim=1)
+
+        # Continue with the remaining convolutional layers
+        out = self.layer2(combined_input)
+        out = self.layer3(out)
+        out = self.avgpool(out)
+        out = out.view(out.size(0), -1)  # Flatten the feature map
+        out = self.fc(out)
+        return out
+
 
 class CompressibilityScorer(torch.nn.Module):
     def __init__(self, dtype):

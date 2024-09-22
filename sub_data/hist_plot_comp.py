@@ -52,6 +52,8 @@ class CompressibilityDataset(Dataset):
         self.image_files = [f for f in os.listdir(image_dir) if f.endswith('.png') or f.endswith('.jpg') or f.endswith('.jpeg')]
         print(f"Found {len(self.image_files)} images in {image_dir}")
         
+        self.problematic_images = []
+        
         if transform is not None:
             self.transform = transform
         else:
@@ -66,8 +68,16 @@ class CompressibilityDataset(Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self.image_dir, self.image_files[idx])
         try:
-            with Image.open(img_path) as img:
-                image = img.convert('RGB')
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                with Image.open(img_path) as img:
+                    image = img.convert('RGB')
+
+                # Check for warnings related to EXIF data
+                for warning in w:
+                    if "Corrupt EXIF data" in str(warning.message):
+                        self.problematic_images.append(img_path)
+                        print(f"Warning for image {img_path}: {warning.message}")
         except Exception as e:
             print(f"Error processing image {img_path}: {e}")
         

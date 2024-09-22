@@ -43,7 +43,7 @@ class SinusoidalTimeMLP(nn.Module):
 
     def sinusoidal_encoding(self, timesteps):
         # Normalize timesteps to be in the range [0, 1]
-        timesteps = timesteps.float() / 50.0  # Assuming timesteps are provided as integers
+        timesteps = timesteps.float() / 1000.0  # Assuming timesteps are provided as integers
     
         # Generate a series of frequencies
         frequencies = torch.exp(torch.arange(0, self.time_encoding_dim, 2, dtype=torch.float32) * -(math.log(10000.0) / self.time_encoding_dim))
@@ -160,7 +160,7 @@ class condition_AestheticScorerDiff(torch.nn.Module):
 if __name__ == "__main__":
     model = SinusoidalTimeMLP()
     embed = torch.randn(32, 768)
-    timesteps = torch.randint(low=0, high=50, size=(32,))
+    timesteps = torch.randint(low=0, high=1000, size=(32,))
     
     print(model.sinusoidal_encoding(timesteps).shape)
     print(model(embed, timesteps).shape)
